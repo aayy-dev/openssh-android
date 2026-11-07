@@ -1,0 +1,24 @@
+[submodule "openssh-portable"]
+	path = openssh-portable
+	url = https://github.com/openssh/openssh-portable
+	branch = master
+[submodule "openssl"]
+	path = openssl
+	url = https://github.com/openssl/openssl
+	branch = master
+[submodule "zlib"]
+	path = zlib
+	url = https://github.com/madler/zlib
+	branch = master
+[submodule "libfido2"]
+	path = libfido2
+	url = https://github.com/Yubico/libfido2
+	branch = main
+[submodule "bash"]
+	path = bash
+	url = https://git.savannah.gnu.org/git/bash.git
+	branch = master
+[submodule "zsh"]
+	path = zsh
+	url = https://github.com/zsh-users/zsh
+	branch = master
