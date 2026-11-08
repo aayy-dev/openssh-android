@@ -147,6 +147,13 @@ cmd_reload() {
 		return 1
 	fi
 	osa_apply_sepolicy
+	# The manager serves the WebUI from the installed dir until the next boot
+	# moves the update there; give it the new page now.
+	if [ "$MODDIR" != "$OSA_INSTALLED" ] && [ -d "$OSA_INSTALLED/webroot" ] && [ -d "$MODDIR/webroot" ]; then
+		cp -f "$MODDIR"/webroot/* "$OSA_INSTALLED/webroot/" &&
+		    chmod 644 "$OSA_INSTALLED"/webroot/* &&
+		    $TOYBOX chcon u:object_r:system_file:s0 "$OSA_INSTALLED"/webroot/*
+	fi
 	osa_mark "reload at $(date '+%Y-%m-%d %H:%M:%S') ($(osa_version))"
 	osa_log "reloaded from $MODDIR ($(osa_version))"
 	if [ -n "$was" ] || { [ ! -f "$OSA_RUN/stopped" ] && [ ! -f "$OSA_STATE/no_autostart" ]; }; then
@@ -213,8 +220,16 @@ cmd_status() {
 		    "$([ -f "$OSA_STATE/no_wakelock" ] && echo false || echo true)" \
 		    "$([ -f "$OSA_STATE/no_autostart" ] && echo false || echo true)"
 		printf '"shells":{"root":%s,"shell":%s},' "$(json_str "$(user_shell root)")" "$(json_str "$(user_shell shell)")"
-		upd=; [ "$MODDIR" != "$OSA_UPDATE" ] && [ -f "$OSA_UPDATE/module.prop" ] && upd=$(osa_version "$OSA_UPDATE")
-		printf '"version":%s,"update":%s,"adbPort":%s,' "$(json_str "$(osa_version)")" "$(json_str "$upd")" \
+		# Version of the files actually mounted; an installed update is offered
+		# until it's mounted (also after a reinstall over a live-applied one,
+		# whose mounted files the installer has just deleted).
+		ver=$(cat "$OSA_PREFIX/share/openssh/version" 2>/dev/null || osa_version)
+		upd=
+		if [ -f "$OSA_UPDATE/module.prop" ] && { [ "$MODDIR" != "$OSA_UPDATE" ] ||
+		    grep -q '/adb/modules_update/openssh/product[^ ]*//deleted' /proc/self/mountinfo; }; then
+			upd=$(osa_version "$OSA_UPDATE")
+		fi
+		printf '"version":%s,"update":%s,"adbPort":%s,' "$(json_str "$ver")" "$(json_str "$upd")" \
 		    "$(json_str "$(cat "$OSA_STATE/adb_tcp_port" 2>/dev/null)")"
 		printf '"addresses":%s,"fingerprints":%s}\n' "$(json_str "$addrs")" "$(json_str "$fps")"
 		return 0

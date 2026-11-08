@@ -64,7 +64,14 @@ fi
 n=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$ROOT_HOME/.ssh/authorized_keys" 2>/dev/null)
 ui_print "- Root has ${n:-0} authorized key(s) in $HOME_LINK/.ssh/authorized_keys"
 [ "${n:-0}" -gt 0 ] || ui_print "  ! Add one before connecting, e.g.: sshdctl addkey 'ssh-ed25519 AAAA...'"
-if [ "$BOOTMODE" = true ] && osa_pid >/dev/null; then
+if [ "$BOOTMODE" = true ] && [ "$(cat "$OSA_RUN/moddir" 2>/dev/null)" = "$MODPATH" ]; then
+	# The running copy was this very directory (an update applied without a
+	# reboot), and the installer has just deleted and replaced its files, so
+	# new SSH connections fail until it's mounted again: switch now.
+	ui_print "- The running copy was replaced by this install; switching to it now"
+	/system/bin/sh "$MODPATH/product/bin/sshdctl" reload 2>&1 | while IFS= read -r l; do ui_print "  $l"; done
+	osa_pid >/dev/null || ui_print "  ! sshd isn't running; check: sshdctl log"
+elif [ "$BOOTMODE" = true ] && osa_pid >/dev/null; then
 	ui_print "- The running copy keeps working until you switch to this one:"
 	ui_print "  soft reboot, or run: sshdctl reload  (WebUI: Apply update)"
 else

@@ -1,6 +1,6 @@
 id=openssh
 name=OpenSSH for Android
-version=v10.6p1-4
-versionCode=4
+version=v10.6p1-5
+versionCode=5
 author=aayy-dev
 description=OpenSSH server and client with zsh, bash and rsync. Logins as root, shell or any app; keys in /data/home/.ssh.

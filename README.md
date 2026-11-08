@@ -115,7 +115,9 @@ To switch without any reboot, install the update and run `sshdctl reload`
 watchdog, and leaves open sessions alone; the next boot moves the update
 into place as usual. Zygote's copies are replaced too, so apps started
 afterwards get the new files (and KernelSU's per-app unmount); apps that are
-already running keep the copy they had until they restart.
+already running keep the copy they had until they restart. Installing again
+before that boot replaces the files in use, so the installer switches to the
+new ones by itself.
 
 Disabling or removing the module takes effect within 5 minutes without a
 reboot: the watchdog stops sshd, removes the mounts and drops the module's

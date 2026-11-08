@@ -233,6 +233,9 @@ build_module() {
 	local ver vcode
 	ver=$(sed -n 's/^version=//p' "$m/module.prop")
 	vcode=$(sed -n 's/^versionCode=//p' "$m/module.prop")
+	# The version of the files themselves: the manager rewrites the installed
+	# module.prop as soon as an update is installed, before it's applied.
+	echo "$ver" > "$m/product/share/openssh/version"
 	mkdir -p "$OUT"
 	local zip="$OUT/openssh-android-${ver}-${ABI}.zip"
 	rm -f "$zip"

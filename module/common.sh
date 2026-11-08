@@ -32,7 +32,13 @@ osa_mark() {
 	echo "--- $* ---" >> "$OSA_LOG/sshd.log"
 }
 
-osa_version() { sed -n 's/^version=//p' "${1:-$MODDIR}/module.prop" 2>/dev/null; }
+# Version of the module files in $1 (default: the ones in use).  module.prop
+# can already name a newer version: the manager rewrites the installed one
+# when an update is installed, before it's applied.
+osa_version() {
+	cat "${1:-$MODDIR}/product/share/openssh/version" 2>/dev/null ||
+	    sed -n 's/^version=//p' "${1:-$MODDIR}/module.prop" 2>/dev/null
+}
 
 osa_busybox() {
 	for b in /data/adb/ksu/bin/busybox /data/adb/magisk/busybox /data/adb/ap/bin/busybox; do

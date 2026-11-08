@@ -14,6 +14,8 @@
 		--accent: #6d9cff; --ok: #4cc27f; --bad: #ff6b5e; --code: #23272e; }
 }
 * { box-sizing: border-box; }
+/* Author display rules (.notice is flex) would otherwise override [hidden]. */
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--fg);
 	font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 	padding: max(16px, env(safe-area-inset-top)) 16px 32px; }
