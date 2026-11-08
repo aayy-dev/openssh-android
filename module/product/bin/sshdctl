@@ -1,0 +1,389 @@
+#!/system/bin/sh
+# sshdctl: control the OpenSSH for Android module (run as root).
+
+# Act as the copy of the module that is mounted: after `sshdctl reload`
+# applies a pending update, that is modules_update/openssh until the next
+# boot moves it into place.  Older copies (e.g. the one the WebUI calls)
+# hand over to it.
+_live=$(cat /data/adb/openssh/run/moddir 2>/dev/null)
+_self=${0%/product/bin/sshdctl}   # this copy's module dir, when run by its full path
+if [ -n "$OSA_MODDIR" ]; then MODDIR=$OSA_MODDIR
+elif [ -f "$_live/common.sh" ]; then MODDIR=$_live
+elif [ "$_self" != "$0" ] && [ -f "$_self/common.sh" ]; then MODDIR=$_self
+else MODDIR=/data/adb/modules/openssh; fi
+[ -f "$MODDIR/common.sh" ] || { echo "sshdctl: module not installed at $MODDIR" >&2; exit 1; }
+if [ -z "$OSA_LIVE" ] && [ "$MODDIR" = "$_live" ] && [ "$0" != "$MODDIR/product/bin/sshdctl" ] &&
+    [ -f "$MODDIR/product/bin/sshdctl" ]; then
+	OSA_LIVE=1 OSA_MODDIR=$MODDIR exec /system/bin/sh "$MODDIR/product/bin/sshdctl" "$@"
+fi
+. "$MODDIR/common.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: sshdctl <command> [args]
+
+  start | stop | restart     control the SSH server
+  reload                     re-mount the module's files and restart sshd,
+                             applying an installed update without a reboot
+  status [--json]            server state, addresses and host key fingerprints
+  test                       check sshd_config for errors
+  log [--all] [lines]        the sshd log since this boot (--all: every boot)
+  log --clear                empty the log
+  adb [on|off|PORT]          adb over the network at every boot (port 5555)
+  shell [user [sh|zsh|bash|PATH]]
+                             show or set the interactive shell for a user
+                             (used for ssh logins and adb shell)
+  addkey [-u user] KEY|FILE  authorize a public key (default user: root)
+  import                     authorize keys from /sdcard/Download
+                             (authorized_keys and *.pub)
+  keepawake [on|off]         hold a wakelock all the time (uses battery)
+  wakelock [on|off]          hold a wakelock while sessions are open (default on)
+  autostart [on|off]         start sshd at boot (default on)
+  paths                      show where configuration and keys live
+
+Accounts: root@ (default for unknown names), shell@ (like adb shell),
+system names (system@, radio@ ...) and apps (com.example.app@ or u0_a123@).
+EOF
+}
+
+[ "$(id -u)" = 0 ] || { echo "sshdctl: must be run as root" >&2; exit 1; }
+
+# Run in init's mount namespace so sessions see the same mounts as adb.
+if ! osa_in_init_ns && [ -z "$OSA_NSENTER" ]; then
+	OSA_NSENTER=1 exec /system/bin/nsenter -t 1 -m -- /system/bin/sh "$0" "$@"
+fi
+
+SSHD=$OSA_PREFIX/bin/sshd
+CFG=$OSA_ETC/sshd_config
+
+cmd_start() {
+	if p=$(osa_pid); then echo "sshd already running (pid $p)"; return 0; fi
+	# Not mounted (e.g. re-enabled after a disable without rebooting).
+	if [ ! -x "$SSHD" ] && [ -z "$OSA_RELOADING" ]; then
+		echo "the module's files aren't mounted; reloading"
+		cmd_reload; return $?
+	fi
+	osa_ensure_state
+	# Homes and authorized_keys modes (StrictModes refuses e.g. a 0666 file
+	# pushed with adb since boot).
+	osa_ensure_homes
+	osa_publish_passwd
+	[ -s "$OSA_RUN/init.env" ] || osa_snapshot_env
+	"$OSA_PREFIX/bin/ssh-keygen" -A >/dev/null 2>&1
+	if ! out=$("$SSHD" -t -f "$CFG" 2>&1); then
+		echo "sshd_config has errors, not starting:"; echo "$out"
+		osa_log "start refused: $out"; return 1
+	fi
+	# Rotate the log at 1 MiB.
+	[ "$(stat -c %s "$OSA_LOG/sshd.log" 2>/dev/null || echo 0)" -gt 1048576 ] &&
+	    mv -f "$OSA_LOG/sshd.log" "$OSA_LOG/sshd.log.1"
+
+	set --
+	path=
+	while IFS= read -r l; do
+		case $l in
+			PATH=*) path=${l#PATH=} ;;
+			*=*) set -- "$@" "$l" ;;
+		esac
+	done < "$OSA_RUN/init.env"
+	[ -n "$path" ] || path=$OSA_PREFIX/bin:/system/bin:/system/xbin:/vendor/bin
+	case ":$path:" in *":$OSA_PREFIX/bin:"*) ;; *) path=$OSA_PREFIX/bin:$path ;; esac
+	if mb=$(osa_manager_bin); then
+		case ":$path:" in *":$mb:"*) ;; *) path=$path:$mb ;; esac
+	fi
+	wl=1; [ -f "$OSA_STATE/no_wakelock" ] && wl=0
+
+	env -i "$@" PATH="$path" TMPDIR=/data/local/tmp LANG=C.UTF-8 \
+	    HOSTNAME="$(osa_hostname)" OSA_WAKELOCK=$wl \
+	    "$SSHD" -f "$CFG" -E "$OSA_LOG/sshd.log"
+	rc=$?
+	rm -f "$OSA_RUN/stopped"
+	sleep 0.3
+	if p=$(osa_pid); then
+		osa_ksu_mark "$p"
+		echo "sshd started (pid $p)"; osa_log "sshd started (pid $p)"
+	else
+		echo "sshd failed to start (exit $rc); see: sshdctl log"; osa_log "sshd failed to start ($rc)"
+		rc=1
+	fi
+	osa_update_description
+	return $rc
+}
+
+cmd_stop() {
+	touch "$OSA_RUN/stopped"
+	if p=$(osa_pid); then
+		kill "$p" && echo "sshd stopped (open sessions stay connected)"
+		osa_log "sshd stopped"
+	else
+		echo "sshd is not running"
+	fi
+	rm -f "$OSA_RUN/sshd.pid"
+	osa_update_description
+}
+
+# Re-mount the module's files and restart sshd without rebooting.  Applies
+# an installed update (modules_update/openssh) right away; the next boot
+# moves it into place as usual.  Open sessions keep their old binaries.
+cmd_reload() {
+	src=$MODDIR
+	[ -f "$OSA_UPDATE/module.prop" ] && [ -f "$OSA_UPDATE/common.sh" ] && src=$OSA_UPDATE
+	if [ "$src" != "$MODDIR" ] && [ -z "$OSA_RELOADING" ]; then
+		# Let the new version do its own reload.
+		OSA_RELOADING=1 OSA_LIVE=1 OSA_MODDIR=$src exec /system/bin/sh "$src/product/bin/sshdctl" reload
+	fi
+	if [ -f "$OSA_INSTALLED/disable" ] || [ -f "$OSA_INSTALLED/remove" ]; then
+		echo "the module is disabled or marked for removal; enable it first" >&2
+		return 1
+	fi
+	OSA_RELOADING=1   # cmd_start below must not call reload again
+	echo "reloading OpenSSH for Android $(osa_version) from $MODDIR"
+	was=; osa_pid >/dev/null && was=1
+	osa_ensure_state
+	osa_ensure_homes
+	osa_publish_passwd
+	if ! osa_mount_all; then
+		echo "mounting failed; see $OSA_LOG/module.log" >&2
+		return 1
+	fi
+	osa_apply_sepolicy
+	osa_mark "reload at $(date '+%Y-%m-%d %H:%M:%S') ($(osa_version))"
+	osa_log "reloaded from $MODDIR ($(osa_version))"
+	if [ -n "$was" ] || { [ ! -f "$OSA_RUN/stopped" ] && [ ! -f "$OSA_STATE/no_autostart" ]; }; then
+		cmd_stop >/dev/null; sleep 0.5; cmd_start
+	fi
+	osa_watchdog_spawn
+	osa_update_description
+	echo "done (open sessions keep running the previous version until they log out)"
+}
+
+# sshd.log since this boot (from the last "--- boot" line), every boot, or
+# cleared.  sshd opens the log with O_APPEND, so truncating it is safe.
+cmd_log() {
+	mode=boot n=300
+	for a in "$@"; do
+		case $a in
+			--all) mode=all ;;
+			--boot) mode=boot ;;
+			--clear) mode=clear ;;
+			*[!0-9]*|"") echo "usage: sshdctl log [--all|--clear] [lines]" >&2; return 1 ;;
+			*) n=$a ;;
+		esac
+	done
+	f=$OSA_LOG/sshd.log
+	case $mode in
+		clear) : > "$f"; rm -f "$f.1"; osa_log "sshd log cleared"; echo "log cleared" ;;
+		all) cat "$f.1" "$f" 2>/dev/null | tail -n "$n" ;;
+		boot) cat "$f.1" "$f" 2>/dev/null |
+		    awk 'index($0, "--- boot ") == 1 { n = 0 } { l[n++] = $0 } END { for (i = 0; i < n; i++) print l[i] }' |
+		    tail -n "$n" ;;
+	esac
+}
+
+cmd_adb() {
+	case $1 in
+		"") ;;
+		on) echo 5555 > "$OSA_STATE/adb_tcp_port"; osa_adb_tcp_apply ;;
+		off) rm -f "$OSA_STATE/adb_tcp_port"; osa_adb_tcp_apply off ;;
+		*[!0-9]*) echo "use on, off or a port number" >&2; return 1 ;;
+		*) echo "$1" > "$OSA_STATE/adb_tcp_port"; osa_adb_tcp_apply ;;
+	esac
+	p=$(cat "$OSA_STATE/adb_tcp_port" 2>/dev/null)
+	if [ -n "$p" ]; then echo "adb over the network: on, port $p (set at every boot)"
+	else echo "adb over the network: off (left as Android sets it)"; fi
+}
+
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\t' '  ')"; }
+
+cmd_status() {
+	p=$(osa_pid)
+	port=$(awk 'tolower($1) == "port" { print $2; exit }' "$CFG" 2>/dev/null)
+	addrs=$(ip -o addr show 2>/dev/null | awk '$2 != "lo" && ($3 == "inet" || $3 == "inet6") && $4 !~ /^fe80/ { sub(/\/.*/, "", $4); print $2 "=" $4 }')
+	fps=$(for k in "$OSA_ETC"/ssh_host_*_key.pub; do [ -f "$k" ] && "$OSA_PREFIX/bin/ssh-keygen" -lf "$k" 2>/dev/null; done)
+	# grep -c prints 0 itself when nothing matches (and exits 1), so no "|| echo 0".
+	rootkeys=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$ROOT_HOME/.ssh/authorized_keys" 2>/dev/null)
+	shellkeys=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$SHELL_HOME/.ssh/authorized_keys" 2>/dev/null)
+	sess=$(cat /sys/power/wake_lock 2>/dev/null | tr ' ' '\n' | grep -c '^openssh-[0-9]')
+	if [ "$1" = --json ]; then
+		printf '{"running":%s,"pid":%s,"port":%s,"hostname":%s,' \
+		    "$([ -n "$p" ] && echo true || echo false)" "${p:-null}" "${port:-22}" "$(json_str "$(osa_hostname)")"
+		printf '"sessions":%s,"rootKeys":%s,"shellKeys":%s,' "${sess:-0}" "${rootkeys:-0}" "${shellkeys:-0}"
+		printf '"keepawake":%s,"wakelock":%s,"autostart":%s,' \
+		    "$([ -f "$OSA_STATE/keepawake" ] && echo true || echo false)" \
+		    "$([ -f "$OSA_STATE/no_wakelock" ] && echo false || echo true)" \
+		    "$([ -f "$OSA_STATE/no_autostart" ] && echo false || echo true)"
+		printf '"shells":{"root":%s,"shell":%s},' "$(json_str "$(user_shell root)")" "$(json_str "$(user_shell shell)")"
+		upd=; [ "$MODDIR" != "$OSA_UPDATE" ] && [ -f "$OSA_UPDATE/module.prop" ] && upd=$(osa_version "$OSA_UPDATE")
+		printf '"version":%s,"update":%s,"adbPort":%s,' "$(json_str "$(osa_version)")" "$(json_str "$upd")" \
+		    "$(json_str "$(cat "$OSA_STATE/adb_tcp_port" 2>/dev/null)")"
+		printf '"addresses":%s,"fingerprints":%s}\n' "$(json_str "$addrs")" "$(json_str "$fps")"
+		return 0
+	fi
+	if [ -n "$p" ]; then echo "sshd: running (pid $p) on port ${port:-22}"; else echo "sshd: stopped"; fi
+	echo "open sessions: ${sess:-0}"
+	echo "authorized keys: root=$rootkeys shell=$shellkeys"
+	echo "keep-awake: $([ -f "$OSA_STATE/keepawake" ] && echo on || echo off)," \
+	    "session wakelock: $([ -f "$OSA_STATE/no_wakelock" ] && echo off || echo on)," \
+	    "autostart: $([ -f "$OSA_STATE/no_autostart" ] && echo off || echo on)"
+	echo "shells: root=$(user_shell root) shell=$(user_shell shell)"
+	echo "addresses:"; echo "$addrs" | sed 's/=/  /; s/^/  /'
+	echo "host keys:"; echo "$fps" | sed 's/^/  /'
+}
+
+user_shell() {
+	s=$(awk -F: -v u="$1" '$1 == u { print $3 }' "$OSA_ETC/passwd" 2>/dev/null)
+	echo "${s:-/system/bin/sh}"
+}
+
+cmd_shell() {
+	if [ $# -eq 0 ]; then
+		for u in root shell; do echo "$u: $(user_shell $u)"; done
+		awk -F: '!/^#/ && NF && $1 != "root" && $1 != "shell" { print $1 ": " ($3 ? $3 : "/system/bin/sh") }' "$OSA_ETC/passwd"
+		return 0
+	fi
+	u=$1
+	[ $# -eq 1 ] && { echo "$u: $(user_shell "$u")"; return 0; }
+	case $2 in
+		sh|mksh) s=/system/bin/sh ;;
+		zsh) s=$OSA_PREFIX/bin/zsh ;;
+		bash) s=$OSA_PREFIX/bin/bash ;;
+		/*) s=$2 ;;
+		*) echo "unknown shell: $2 (use sh, zsh, bash or an absolute path)" >&2; return 1 ;;
+	esac
+	[ -x "$s" ] || { echo "$s is not executable" >&2; return 1; }
+	case $u in *:*|"") echo "bad user name" >&2; return 1 ;; esac
+	tmp=$OSA_ETC/passwd.tmp
+	if grep -q "^$u:" "$OSA_ETC/passwd"; then
+		awk -F: -v OFS=: -v u="$u" -v s="$s" '$1 == u { $3 = s } { print }' "$OSA_ETC/passwd" > "$tmp"
+	else
+		{ cat "$OSA_ETC/passwd"; echo "$u::$s"; } > "$tmp"
+	fi
+	chmod 644 "$tmp" && mv -f "$tmp" "$OSA_ETC/passwd" && osa_publish_passwd
+	echo "$u: $s (applies to new ssh logins and adb shells)"
+}
+
+key_file_for() {
+	case $1 in
+		root|"") echo "$ROOT_HOME/.ssh/authorized_keys" ;;
+		shell) echo "$SHELL_HOME/.ssh/authorized_keys" ;;
+		*) return 1 ;;
+	esac
+}
+
+fix_key_perms() {
+	case $1 in
+		shell) chown -R 2000:2000 "$SHELL_HOME/.ssh"; $TOYBOX chcon -R u:object_r:shell_data_file:s0 "$SHELL_HOME/.ssh" ;;
+		*) chown -R 0:0 "$ROOT_HOME/.ssh" ;;
+	esac
+	chmod 700 "$(dirname "$2")"; chmod 600 "$2"
+}
+
+# Append valid public keys from stdin to $1's authorized_keys (skip dupes).
+add_keys() {
+	user=$1 f=$(key_file_for "$1") || { echo "keys can only be added for root or shell" >&2; return 1; }
+	osa_ensure_homes
+	n=0
+	while IFS= read -r k; do
+		case $k in ssh-*|ecdsa-*|sk-*) ;; *) continue ;; esac
+		echo "$k" > "$OSA_RUN/key.tmp"
+		"$OSA_PREFIX/bin/ssh-keygen" -lf "$OSA_RUN/key.tmp" >/dev/null 2>&1 || { echo "skipping invalid key: ${k%% *} ..."; continue; }
+		body=$(echo "$k" | awk '{print $1" "$2}')
+		if grep -qF "$body" "$f" 2>/dev/null; then continue; fi
+		echo "$k" >> "$f"; n=$((n + 1))
+		echo "added: $("$OSA_PREFIX/bin/ssh-keygen" -lf "$OSA_RUN/key.tmp")"
+	done
+	rm -f "$OSA_RUN/key.tmp"
+	fix_key_perms "$user" "$f"
+	echo "$n new key(s) for $user"
+	osa_update_description
+}
+
+cmd_addkey() {
+	user=root
+	[ "$1" = -u ] && { user=$2; shift 2; }
+	[ $# -gt 0 ] || { echo "usage: sshdctl addkey [-u user] KEY|FILE" >&2; return 1; }
+	if [ -f "$1" ]; then add_keys "$user" < "$1"; else echo "$*" | add_keys "$user"; fi
+}
+
+cmd_import() {
+	d=/sdcard/Download
+	found=0
+	for f in "$d/authorized_keys" "$d"/*.pub; do
+		[ -f "$f" ] || continue
+		found=1; echo "from $f:"; add_keys root < "$f"
+	done
+	[ $found = 1 ] || echo "no authorized_keys or *.pub files in $d"
+}
+
+toggle() { # flagfile on-means-present on|off
+	case $3 in
+		on) if [ "$2" = present ]; then touch "$1"; else rm -f "$1"; fi ;;
+		off) if [ "$2" = present ]; then rm -f "$1"; else touch "$1"; fi ;;
+		"") ;;
+		*) echo "use on or off" >&2; return 1 ;;
+	esac
+	if [ -f "$1" ]; then [ "$2" = present ] && echo on || echo off
+	else [ "$2" = present ] && echo off || echo on; fi
+}
+
+case $1 in
+	start) cmd_start ;;
+	stop) cmd_stop ;;
+	restart) cmd_stop >/dev/null; sleep 0.5; cmd_start ;;
+	reload) cmd_reload ;;
+	status) shift; cmd_status "$@" ;;
+	test) "$SSHD" -t -f "$CFG" && echo "sshd_config OK" ;;
+	log) shift; cmd_log "$@" ;;
+	adb) cmd_adb "$2" ;;
+	shell) shift; cmd_shell "$@" ;;
+	addkey) shift; cmd_addkey "$@" ;;
+	import) cmd_import ;;
+	keepawake) echo "keep-awake: $(toggle "$OSA_STATE/keepawake" present "$2")"; osa_keepawake_apply; osa_update_description ;;
+	wakelock) echo "session wakelock: $(toggle "$OSA_STATE/no_wakelock" absent "$2") (restart sshd to apply)" ;;
+	autostart) echo "autostart: $(toggle "$OSA_STATE/no_autostart" absent "$2")" ;;
+	paths)
+		cat <<-EOF
+		sshd config:   $CFG  (+ $OSA_ETC/sshd_config.d/*.conf)
+		client config: $OSA_ETC/ssh_config  (per user: ~/.ssh/config)
+		host keys:     $OSA_ETC/ssh_host_*_key
+		accounts:      $OSA_ETC/passwd  (name:home:shell)
+		root home:     $ROOT_HOME  (also $HOME_LINK); keys in $ROOT_HOME/.ssh/authorized_keys
+		shell home:    $SHELL_HOME; keys in $SHELL_HOME/.ssh/authorized_keys
+		logs:          $OSA_LOG/sshd.log, $OSA_LOG/module.log
+		EOF
+		;;
+	put)
+		# Used by the WebUI: sshdctl put NAME BASE64
+		case $2 in
+			sshd_config) f=$CFG ;;
+			ssh_config) f=$OSA_ETC/ssh_config ;;
+			keys:root) f=$(key_file_for root) ;;
+			keys:shell) f=$(key_file_for shell) ;;
+			*) echo "unknown file: $2" >&2; exit 1 ;;
+		esac
+		echo "$3" | base64 -d > "$f.new" || { rm -f "$f.new"; echo "decode failed" >&2; exit 1; }
+		if [ "$2" = sshd_config ] && ! out=$("$SSHD" -t -f "$f.new" 2>&1); then
+			rm -f "$f.new"; echo "not saved, sshd_config has errors:"; echo "$out"; exit 1
+		fi
+		[ -f "$f" ] && cp -f "$f" "$f.bak"
+		mv -f "$f.new" "$f"
+		case $2 in
+			keys:root) fix_key_perms root "$f" ;;
+			keys:shell) fix_key_perms shell "$f" ;;
+			sshd_config) chmod 600 "$f" ;;
+			*) chmod 644 "$f" ;;
+		esac
+		echo "saved $f"; osa_update_description
+		;;
+	get)
+		case $2 in
+			sshd_config) cat "$CFG" ;;
+			ssh_config) cat "$OSA_ETC/ssh_config" ;;
+			keys:root) cat "$(key_file_for root)" 2>/dev/null ;;
+			keys:shell) cat "$(key_file_for shell)" 2>/dev/null ;;
+			*) echo "unknown file: $2" >&2; exit 1 ;;
+		esac
+		;;
+	""|-h|--help|help) usage ;;
+	*) echo "sshdctl: unknown command: $1" >&2; usage >&2; exit 1 ;;
+esac

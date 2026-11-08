@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OpenSSH</title>
+<style>
+:root {
+	--bg: #f4f5f7; --card: #ffffff; --fg: #1b1d21; --muted: #6a7078; --line: #e2e4e8;
+	--accent: #2f6fde; --ok: #1f8f4e; --bad: #c4352b; --code: #f0f1f4;
+}
+@media (prefers-color-scheme: dark) {
+	:root { --bg: #111317; --card: #1b1e24; --fg: #e8eaed; --muted: #9aa0a8; --line: #2b2f37;
+		--accent: #6d9cff; --ok: #4cc27f; --bad: #ff6b5e; --code: #23272e; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+	font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+	padding: max(16px, env(safe-area-inset-top)) 16px 32px; }
+main { max-width: 720px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+/* Grid and flex children default to min-width: auto, so one long line
+   (a key, an IPv6 address, a log line) would widen the whole page. */
+main > *, .row > * { min-width: 0; }
+.row.spread > div { flex: 1; }
+h1 { font-size: 22px; margin: 4px 0 2px; }
+h2 { font-size: 15px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.spread { justify-content: space-between; }
+.pill { padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+.pill.on { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.pill.off { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--fg);
+	padding: 8px 14px; border-radius: 10px; min-height: 40px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; }
+select { font: inherit; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--line);
+	background: var(--card); color: var(--fg); min-height: 40px; }
+textarea { width: 100%; min-height: 220px; font: 12.5px/1.4 ui-monospace, Menlo, Consolas, monospace;
+	background: var(--code); color: var(--fg); border: 1px solid var(--line); border-radius: 10px;
+	padding: 10px; resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+pre { margin: 0; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; background: var(--code);
+	border-radius: 10px; padding: 10px; overflow: auto; max-height: 320px;
+	white-space: pre-wrap; overflow-wrap: anywhere; }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; font-size: 14px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+.toggle { display: flex; justify-content: space-between; align-items: center; padding: 8px 0;
+	border-top: 1px solid var(--line); gap: 12px; }
+.toggle:first-of-type { border-top: 0; }
+.toggle small { display: block; color: var(--muted); }
+.switch { position: relative; width: 46px; height: 28px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch span { position: absolute; inset: 0; background: var(--line); border-radius: 999px; transition: .15s; }
+.switch span::after { content: ""; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px;
+	background: #fff; border-radius: 50%; transition: .15s; }
+.switch input:checked + span { background: var(--accent); }
+.switch input:checked + span::after { transform: translateX(18px); }
+.tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.tabs button { min-height: 34px; padding: 5px 12px; }
+.tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.msg { font-size: 13px; color: var(--muted); min-height: 1.2em; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.err { color: var(--bad); }
+.notice { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+	margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+	background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.notice > div { flex: 1 1 200px; min-width: 0; }
+.notice small { display: block; color: var(--muted); }
+code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .92em; }
+</style>
+</head>
+<body>
+<main>
+	<div class="row spread">
+		<div>
+			<h1>OpenSSH for Android</h1>
+			<div class="msg" id="sub">Loading…</div>
+		</div>
+		<span class="pill off" id="state">…</span>
+	</div>
+
+	<section class="card">
+		<h2>Server</h2>
+		<div class="row">
+			<button class="primary" id="btnToggle">Start</button>
+			<button id="btnRestart">Restart</button>
+			<button id="btnRefresh">Refresh</button>
+		</div>
+		<div class="notice" id="update" hidden>
+			<div><b id="updVer"></b> is installed. Apply it now, or soft reboot.
+			<small>Running apps that still see the module keep the old files until they restart.</small></div>
+			<button class="primary" id="btnApply">Apply update</button>
+		</div>
+		<div class="msg" id="srvMsg"></div>
+		<dl class="kv" id="info"></dl>
+	</section>
+
+	<section class="card">
+		<h2>Options</h2>
+		<label class="toggle"><div>Wakelock during sessions<small>Keeps long commands running with the screen off. Restart sshd to apply.</small></div>
+			<span class="switch"><input type="checkbox" id="optWakelock"><span></span></span></label>
+		<label class="toggle"><div>Always awake<small>Holds a wakelock all the time. Uses noticeably more battery.</small></div>
+			<span class="switch"><input type="checkbox" id="optKeepawake"><span></span></span></label>
+		<label class="toggle"><div>Start at boot</div>
+			<span class="switch"><input type="checkbox" id="optAutostart"><span></span></span></label>
+		<label class="toggle"><div>adb over the network<small>Listens on port 5555 after every boot, like <code>adb tcpip 5555</code>. Only computers whose adb key you've authorized can connect.</small></div>
+			<span class="switch"><input type="checkbox" id="optAdb"><span></span></span></label>
+		<div class="toggle"><div>root's shell<small>For ssh logins and adb shell</small></div>
+			<select id="shRoot"><option value="sh">sh (mksh)</option><option value="zsh">zsh</option><option value="bash">bash</option></select></div>
+		<div class="toggle"><div>shell's shell<small>shell@ logins and non-root adb shell</small></div>
+			<select id="shShell"><option value="sh">sh (mksh)</option><option value="zsh">zsh</option><option value="bash">bash</option></select></div>
+	</section>
+
+	<section class="card">
+		<h2>Authorized keys</h2>
+		<div class="tabs" id="keyTabs">
+			<button data-k="keys:root" class="active">root</button>
+			<button data-k="keys:shell">shell</button>
+		</div>
+		<textarea id="keys" spellcheck="false" placeholder="ssh-ed25519 AAAA… you@laptop"></textarea>
+		<div class="row" style="margin-top:10px">
+			<button class="primary" id="btnKeysSave">Save keys</button>
+			<button id="btnImport">Import from Download</button>
+		</div>
+		<div class="msg" id="keysMsg">root's keys also work for shell@ and app logins.</div>
+	</section>
+
+	<section class="card">
+		<h2>Configuration</h2>
+		<div class="tabs" id="cfgTabs">
+			<button data-k="sshd_config" class="active">sshd_config</button>
+			<button data-k="ssh_config">ssh_config</button>
+		</div>
+		<textarea id="cfg" spellcheck="false"></textarea>
+		<div class="row" style="margin-top:10px">
+			<button class="primary" id="btnCfgSave">Save</button>
+			<button id="btnCfgSaveRestart">Save and restart</button>
+		</div>
+		<div class="msg" id="cfgMsg">sshd_config is checked before it's saved.</div>
+	</section>
+
+	<section class="card">
+		<div class="row spread"><h2>Log</h2>
+			<div class="row">
+				<button id="btnLogScope">All boots</button>
+				<button id="btnLogClear">Clear</button>
+				<button id="btnLog">Refresh</button>
+			</div>
+		</div>
+		<div class="msg" id="logMsg"></div>
+		<pre id="log"></pre>
+	</section>
+</main>
+
+<script>
+const CTL = "/data/adb/modules/openssh/product/bin/sshdctl";
+let cbSeq = 0;
+function exec(cmd) {
+	return new Promise((resolve) => {
+		const name = `osa_cb_${Date.now()}_${cbSeq++}`;
+		window[name] = (errno, stdout, stderr) => { delete window[name]; resolve({ errno, stdout, stderr }); };
+		try { ksu.exec(cmd, "{}", name); }
+		catch (e) { delete window[name]; resolve({ errno: -1, stdout: "", stderr: "KernelSU WebUI bridge not available: " + e }); }
+	});
+}
+const $ = (id) => document.getElementById(id);
+function say(el, text, err) { el.textContent = text; el.classList.toggle("err", !!err); }
+function toast(t) { try { ksu.toast(t); } catch (e) {} }
+function b64(text) {
+	const bytes = new TextEncoder().encode(text);
+	let s = ""; for (const b of bytes) s += String.fromCharCode(b);
+	return btoa(s);
+}
+const shellName = (p) => p.endsWith("/zsh") ? "zsh" : p.endsWith("/bash") ? "bash" : "sh";
+function esc(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]); }
+
+let st = null;
+async function refresh() {
+	const r = await exec(`${CTL} status --json`);
+	try { st = JSON.parse(r.stdout); } catch (e) {
+		$("state").textContent = "?"; $("state").className = "pill off";
+		say($("sub"), "Couldn't read status: " + (r.stderr || r.stdout || e.message), true);
+		return;
+	}
+	$("state").textContent = st.running ? "Running" : "Stopped";
+	$("state").className = "pill " + (st.running ? "on" : "off");
+	$("btnToggle").textContent = st.running ? "Stop" : "Start";
+	say($("sub"), st.running ? `ssh root@${st.hostname}${st.port != 22 ? " -p " + st.port : ""}` : "SSH server is stopped");
+	const addrs = st.addresses.trim().split(/\s+/).filter(Boolean).map((a) => a.replace("=", "  ")).join("\n");
+	// "256 SHA256:... root@localhost (ED25519)" -> "ED25519" over the fingerprint.
+	const fps = st.fingerprints.trim().split(/\s{2,}|(?<=\))\s+/).filter(Boolean).map((l) => {
+		const m = l.match(/^\d+\s+(\S+)\s.*\(([^)]+)\)$/);
+		return m ? `${m[2]}\n${m[1]}` : l;
+	}).join("\n");
+	$("info").innerHTML = `
+		<dt>Version</dt><dd>${esc(st.version || "–")}</dd>
+		<dt>Port</dt><dd>${st.port}</dd>
+		<dt>Open sessions</dt><dd>${st.sessions}</dd>
+		<dt>Root keys</dt><dd>${st.rootKeys}</dd>
+		<dt>Shell keys</dt><dd>${st.shellKeys}</dd>
+		<dt>Addresses</dt><dd class="mono" style="white-space:pre-wrap">${esc(addrs) || "–"}</dd>
+		<dt>Host keys</dt><dd class="mono" style="white-space:pre-wrap">${esc(fps) || "–"}</dd>`;
+	$("optWakelock").checked = st.wakelock;
+	$("optKeepawake").checked = st.keepawake;
+	$("optAutostart").checked = st.autostart;
+	$("optAdb").checked = !!st.adbPort;
+	$("update").hidden = !st.update;
+	$("updVer").textContent = st.update || "";
+	$("shRoot").value = shellName(st.shells.root);
+	$("shShell").value = shellName(st.shells.shell);
+}
+
+async function act(cmd, msgEl) {
+	const r = await exec(cmd);
+	const out = (r.stdout + r.stderr).trim();
+	say(msgEl, out, r.errno !== 0);
+	if (out) toast(out.split("\n")[0]);
+	await refresh();
+	return r.errno === 0;
+}
+
+$("btnToggle").onclick = () => act(`${CTL} ${st && st.running ? "stop" : "start"}`, $("srvMsg"));
+$("btnRestart").onclick = () => act(`${CTL} restart`, $("srvMsg"));
+$("btnRefresh").onclick = refresh;
+$("optWakelock").onchange = (e) => act(`${CTL} wakelock ${e.target.checked ? "on" : "off"}`, $("srvMsg"));
+$("optKeepawake").onchange = (e) => act(`${CTL} keepawake ${e.target.checked ? "on" : "off"}`, $("srvMsg"));
+$("optAutostart").onchange = (e) => act(`${CTL} autostart ${e.target.checked ? "on" : "off"}`, $("srvMsg"));
+$("optAdb").onchange = (e) => act(`${CTL} adb ${e.target.checked ? "on" : "off"}`, $("srvMsg"));
+$("btnApply").onclick = async () => {
+	$("btnApply").disabled = true;
+	say($("srvMsg"), "Applying the update…");
+	await act(`${CTL} reload`, $("srvMsg"));
+	$("btnApply").disabled = false;
+	loadLog();
+};
+$("shRoot").onchange = (e) => act(`${CTL} shell root ${e.target.value}`, $("srvMsg"));
+$("shShell").onchange = (e) => act(`${CTL} shell shell ${e.target.value}`, $("srvMsg"));
+
+function tabs(container, onSelect) {
+	let current = container.querySelector(".active").dataset.k;
+	container.querySelectorAll("button").forEach((b) => b.onclick = () => {
+		container.querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+		current = b.dataset.k; onSelect(current);
+	});
+	return () => current;
+}
+async function load(name, el) { const r = await exec(`${CTL} get ${name}`); el.value = r.stdout; }
+const keyTab = tabs($("keyTabs"), (k) => load(k, $("keys")));
+const cfgTab = tabs($("cfgTabs"), (k) => load(k, $("cfg")));
+
+$("btnKeysSave").onclick = () => act(`${CTL} put ${keyTab()} '${b64($("keys").value)}'`, $("keysMsg"));
+$("btnImport").onclick = async () => { await act(`${CTL} import`, $("keysMsg")); load(keyTab(), $("keys")); };
+$("btnCfgSave").onclick = () => act(`${CTL} put ${cfgTab()} '${b64($("cfg").value)}'`, $("cfgMsg"));
+$("btnCfgSaveRestart").onclick = async () => {
+	if (await act(`${CTL} put ${cfgTab()} '${b64($("cfg").value)}'`, $("cfgMsg")) && cfgTab() === "sshd_config")
+		act(`${CTL} restart`, $("srvMsg"));
+};
+// Log: this boot by default, every boot on request; clearing needs a second tap
+// (WebView's confirm() isn't reliable).
+let logAll = false, clearArmed = 0;
+async function loadLog() {
+	const r = await exec(`${CTL} log ${logAll ? "--all 500" : "300"}`);
+	const el = $("log");
+	el.textContent = r.stdout || (logAll ? "(empty)" : "(nothing logged since this boot)");
+	el.scrollTop = el.scrollHeight;
+	$("btnLogScope").textContent = logAll ? "This boot" : "All boots";
+	say($("logMsg"), logAll ? "All boots (last 500 lines)" : "Since this boot");
+}
+$("btnLog").onclick = loadLog;
+$("btnLogScope").onclick = () => { logAll = !logAll; loadLog(); };
+$("btnLogClear").onclick = async () => {
+	const b = $("btnLogClear");
+	if (Date.now() - clearArmed > 3000) {
+		clearArmed = Date.now(); b.textContent = "Tap to confirm";
+		setTimeout(() => { if (Date.now() - clearArmed >= 3000) b.textContent = "Clear"; }, 3100);
+		return;
+	}
+	clearArmed = 0; b.textContent = "Clear";
+	await exec(`${CTL} log --clear`);
+	loadLog();
+};
+
+refresh();
+load("keys:root", $("keys"));
+load("sshd_config", $("cfg"));
+loadLog();
+</script>
+</body>
+</html>

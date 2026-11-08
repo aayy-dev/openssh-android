@@ -1,0 +1,33 @@
+# sshd_config for OpenSSH for Android.
+# Edit here or in the WebUI, then run: sshdctl restart
+# Drop-in files: /data/adb/openssh/etc/sshd_config.d/*.conf
+Include /data/adb/openssh/etc/sshd_config.d/*.conf
+
+Port 22
+#ListenAddress 0.0.0.0
+#ListenAddress ::
+
+HostKey /data/adb/openssh/etc/ssh_host_ed25519_key
+HostKey /data/adb/openssh/etc/ssh_host_ecdsa_key
+HostKey /data/adb/openssh/etc/ssh_host_rsa_key
+
+# Keys only: Android has no password database.
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+StrictModes yes
+
+# Each account's own ~/.ssh/authorized_keys, plus root's keys
+# (/data/root/.ssh/authorized_keys) for every account: root's keys can log in
+# as shell@, system@, apps, etc.
+AuthorizedKeysFile .ssh/authorized_keys
+AuthorizedKeysCommand /product/libexec/openssh-authorized-keys %u
+AuthorizedKeysCommandUser root
+
+UseDNS no
+PrintMotd no
+AcceptEnv LANG LC_* COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION
+
+# Runs as the logged-in user through /system/bin/sh.
+Subsystem sftp /product/libexec/sftp-server

@@ -1,0 +1,6 @@
+#!/system/bin/sh
+# sshd AuthorizedKeysCommand: root's authorized keys are valid for every
+# account (shell@, system@, apps), in addition to the account's own keys.
+f=/data/root/.ssh/authorized_keys
+[ -f "$f" ] && cat "$f"
+exit 0

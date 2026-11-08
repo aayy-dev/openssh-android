@@ -1,0 +1,12 @@
+# Global zshenv (OpenSSH for Android module, replaced on update).
+# Put your own settings in ~/.zshenv and ~/.zshrc.
+export _OSA_SHELL=1
+export TMPDIR=${TMPDIR:-/data/local/tmp}
+export LANG=${LANG:-C.UTF-8}
+TMPPREFIX=${TMPDIR:-/data/local/tmp}/zsh   # here-docs; /tmp is not on every device
+if [[ ${HOME:-/} == / ]]; then
+	case $UID in
+	0)	[[ -d /data/root ]] && export HOME=/data/root ;;
+	2000)	[[ -d /data/shell ]] && export HOME=/data/shell ;;
+	esac
+fi

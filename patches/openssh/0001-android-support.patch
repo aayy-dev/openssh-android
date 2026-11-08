@@ -1,0 +1,907 @@
+diff --git a/Makefile.in b/Makefile.in
+index ffc13e0..607d0b1 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -108,7 +108,7 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
+ 	kexgexc.o kexgexs.o kexmlkem768ecdh.o \
+ 	kexsntrup761x25519.o kexmlkem768x25519.o sntrup761.o kexgen.o \
+ 	sftp-realpath.o platform-pledge.o platform-tracing.o platform-misc.o \
+-	sshbuf-io.o misc-agent.o ssherr-libcrypto.o
++	sshbuf-io.o misc-agent.o ssherr-libcrypto.o android.o
+ 
+ P11OBJS= ssh-pkcs11-client.o
+ 
+diff --git a/android.c b/android.c
+new file mode 100644
+index 0000000..c932a0b
+--- /dev/null
++++ b/android.c
+@@ -0,0 +1,370 @@
++/*
++ * Android (bionic) support for OpenSSH.  See android.h.
++ */
++
++/* Real bionic prototypes first: includes.h renames getpwnam/getpwuid. */
++#include <pwd.h>
++#include <grp.h>
++
++#include "includes.h"
++
++#ifdef __ANDROID__
++
++#undef getpwnam
++#undef getpwuid
++
++#include <sys/types.h>
++#include <sys/stat.h>
++
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "log.h"
++#include "android.h"
++
++extern char **environ;
++
++/* adbd's supplementary groups (system/core/adb/daemon/main.cpp). */
++static const gid_t adb_shell_groups[] = {
++	2000,	/* shell */
++	1004,	/* input */
++	1007,	/* log */
++	1011,	/* adb */
++	1015,	/* sdcard_rw */
++	1028,	/* sdcard_r */
++	1078,	/* ext_data_rw */
++	1079,	/* ext_obb_rw */
++	3001,	/* net_bt_admin */
++	3002,	/* net_bt */
++	3003,	/* inet */
++	3006,	/* net_bw_stats */
++	3009,	/* readproc */
++	3011,	/* uhid */
++	3012,	/* readtracefs */
++};
++
++struct app_info {
++	char	name[256];
++	uid_t	uid;
++	char	datadir[PATH_MAX];
++	gid_t	gids[64];
++	int	ngids;
++};
++
++static struct passwd android_pw;
++static char pw_name_buf[256], pw_dir_buf[PATH_MAX], pw_shell_buf[PATH_MAX];
++
++static int
++is_app_uid(uid_t uid)
++{
++	uid_t appid = uid % AID_USER_OFFSET;
++
++	return appid >= AID_APP_START && appid <= AID_APP_END;
++}
++
++/*
++ * Look up "name" in ANDROID_PASSWD_FILE ("name:home:shell" lines).
++ * Empty fields keep the default.  Returns 1 if a line matched.
++ */
++static int
++passwd_override(const char *name, char *home, size_t homelen,
++    char *shell, size_t shelllen)
++{
++	FILE *f;
++	char line[PATH_MAX * 2 + 256], *p, *f_name, *f_home, *f_shell;
++	int found = 0;
++
++	if ((f = fopen(ANDROID_PASSWD_FILE, "re")) == NULL)
++		return 0;
++	while (fgets(line, sizeof(line), f) != NULL) {
++		line[strcspn(line, "\r\n")] = '\0';
++		p = line + strspn(line, " \t");
++		if (*p == '#' || *p == '\0')
++			continue;
++		f_name = strsep(&p, ":");
++		f_home = strsep(&p, ":");
++		f_shell = strsep(&p, ":");
++		if (f_name == NULL || strcmp(f_name, name) != 0)
++			continue;
++		if (f_home != NULL && *f_home == '/')
++			strlcpy(home, f_home, homelen);
++		if (f_shell != NULL && *f_shell == '/')
++			strlcpy(shell, f_shell, shelllen);
++		found = 1;
++		break;
++	}
++	fclose(f);
++	return found;
++}
++
++/*
++ * Look up a package in packages.list, either by name (name != NULL) or by
++ * app id (uid's appid).  Format: "pkg uid debuggable datadir seinfo gids ...".
++ * Only readable by root/system, so this quietly fails for other callers.
++ */
++static int
++package_lookup(const char *name, uid_t uid, struct app_info *ai)
++{
++	FILE *f;
++	char line[4096], *p, *f_pkg, *f_uid, *f_dbg, *f_dir, *f_seinfo, *f_gids, *g;
++	uid_t appid = uid % AID_USER_OFFSET;
++	int found = 0;
++
++	if ((f = fopen(ANDROID_PACKAGES_LIST, "re")) == NULL)
++		return 0;
++	while (fgets(line, sizeof(line), f) != NULL) {
++		line[strcspn(line, "\r\n")] = '\0';
++		p = line;
++		f_pkg = strsep(&p, " ");
++		f_uid = strsep(&p, " ");
++		f_dbg = strsep(&p, " ");
++		f_dir = strsep(&p, " ");
++		f_seinfo = strsep(&p, " ");
++		f_gids = strsep(&p, " ");
++		(void)f_dbg; (void)f_seinfo;
++		if (f_pkg == NULL || f_uid == NULL || f_dir == NULL)
++			continue;
++		if (name != NULL ? strcmp(f_pkg, name) != 0 :
++		    (uid_t)strtoul(f_uid, NULL, 10) != appid)
++			continue;
++		memset(ai, 0, sizeof(*ai));
++		strlcpy(ai->name, f_pkg, sizeof(ai->name));
++		ai->uid = (uid_t)strtoul(f_uid, NULL, 10);
++		strlcpy(ai->datadir, f_dir, sizeof(ai->datadir));
++		if (f_gids != NULL && strcmp(f_gids, "none") != 0) {
++			while ((g = strsep(&f_gids, ",")) != NULL &&
++			    ai->ngids < (int)(sizeof(ai->gids) / sizeof(ai->gids[0])))
++				if (*g != '\0')
++					ai->gids[ai->ngids++] = (gid_t)strtoul(g, NULL, 10);
++		}
++		found = 1;
++		break;
++	}
++	fclose(f);
++	return found;
++}
++
++/* Rewrite a bionic passwd entry with the real home and preferred shell. */
++static struct passwd *
++fixup_pw(const struct passwd *bpw)
++{
++	struct app_info ai;
++	uid_t userid;
++
++	if (bpw == NULL)
++		return NULL;
++	strlcpy(pw_name_buf, bpw->pw_name, sizeof(pw_name_buf));
++	strlcpy(pw_shell_buf, ANDROID_DEFAULT_SHELL, sizeof(pw_shell_buf));
++	if (bpw->pw_uid == AID_ROOT)
++		strlcpy(pw_dir_buf, ANDROID_ROOT_HOME, sizeof(pw_dir_buf));
++	else if (bpw->pw_uid == AID_SHELL)
++		strlcpy(pw_dir_buf, ANDROID_SHELL_HOME, sizeof(pw_dir_buf));
++	else if (is_app_uid(bpw->pw_uid) &&
++	    package_lookup(NULL, bpw->pw_uid, &ai)) {
++		/* packages.list has user 0's path; adjust for other users. */
++		userid = bpw->pw_uid / AID_USER_OFFSET;
++		if (userid != 0 && strncmp(ai.datadir, "/data/user/0/", 13) == 0)
++			snprintf(pw_dir_buf, sizeof(pw_dir_buf), "/data/user/%u/%s",
++			    (u_int)userid, ai.datadir + 13);
++		else
++			strlcpy(pw_dir_buf, ai.datadir, sizeof(pw_dir_buf));
++	} else
++		strlcpy(pw_dir_buf, bpw->pw_dir != NULL ? bpw->pw_dir : "/",
++		    sizeof(pw_dir_buf));
++	passwd_override(pw_name_buf, pw_dir_buf, sizeof(pw_dir_buf),
++	    pw_shell_buf, sizeof(pw_shell_buf));
++
++	memset(&android_pw, 0, sizeof(android_pw));
++	android_pw.pw_name = pw_name_buf;
++	android_pw.pw_passwd = NULL;
++	android_pw.pw_uid = bpw->pw_uid;
++	android_pw.pw_gid = bpw->pw_gid;
++	android_pw.pw_dir = pw_dir_buf;
++	android_pw.pw_shell = pw_shell_buf;
++	return &android_pw;
++}
++
++struct passwd *
++android_getpwnam(const char *name)
++{
++	return fixup_pw(getpwnam(name));
++}
++
++struct passwd *
++android_getpwuid(uid_t uid)
++{
++	return fixup_pw(getpwuid(uid));
++}
++
++struct passwd *
++android_login_pw(const char *user)
++{
++	struct passwd *pw;
++	struct app_info ai;
++
++	if ((pw = android_getpwnam(user)) != NULL)
++		return pw;
++	/* Package names: "ssh com.example.app@phone", like run-as. */
++	if (strchr(user, '.') != NULL && package_lookup(user, 0, &ai) &&
++	    is_app_uid(ai.uid) && (pw = android_getpwuid(ai.uid)) != NULL) {
++		debug("Android: login name %s is package uid %u",
++		    user, (u_int)ai.uid);
++		return pw;
++	}
++	debug("Android: unknown login name %s, using root", user);
++	return android_getpwnam("root");
++}
++
++int
++android_initgroups(const char *name, gid_t basegid)
++{
++	struct passwd *pw;
++	struct app_info ai;
++	gid_t groups[80];
++	int n = 0, i;
++	uid_t uid, appid;
++
++	if ((pw = getpwnam(name)) == NULL)
++		return setgroups(1, &basegid);
++	uid = pw->pw_uid;
++	if (uid == AID_SHELL)
++		return setgroups(sizeof(adb_shell_groups) /
++		    sizeof(adb_shell_groups[0]), adb_shell_groups);
++	groups[n++] = basegid;
++	if (is_app_uid(uid)) {
++		appid = uid % AID_USER_OFFSET;
++		/* What zygote gives apps: permission gids, everybody, cache. */
++		if (package_lookup(NULL, uid, &ai))
++			for (i = 0; i < ai.ngids && n < 76; i++)
++				groups[n++] = ai.gids[i];
++		groups[n++] = 9997;				/* everybody */
++		groups[n++] = (uid / AID_USER_OFFSET) * AID_USER_OFFSET +
++		    20000 + (appid - AID_APP_START);		/* cache gid */
++		groups[n++] = 50000 + (appid - AID_APP_START);	/* shared gid */
++	}
++	return setgroups(n, groups);
++}
++
++static int
++write_attr(const char *path, const char *val)
++{
++	int fd, r = -1;
++	size_t len = strlen(val);
++
++	if ((fd = open(path, O_WRONLY | O_CLOEXEC)) == -1)
++		return -1;
++	if (write(fd, val, len) == (ssize_t)len)
++		r = 0;
++	close(fd);
++	return r;
++}
++
++void
++android_set_selinux_context(uid_t uid)
++{
++	char ctx[128];
++	uid_t appid = uid % AID_USER_OFFSET, userid = uid / AID_USER_OFFSET;
++
++	if (uid == AID_SHELL)
++		strlcpy(ctx, "u:r:shell:s0", sizeof(ctx));
++	else if (is_app_uid(uid)) {
++		/* seapp_contexts: fromRunAs=true domain=runas_app levelFrom=all */
++		appid -= AID_APP_START;
++		snprintf(ctx, sizeof(ctx),
++		    "u:r:runas_app:s0:c%u,c%u,c%u,c%u",
++		    (u_int)(appid & 0xff), (u_int)(256 + ((appid >> 8) & 0xff)),
++		    (u_int)(512 + (userid & 0xff)),
++		    (u_int)(768 + ((userid >> 8) & 0xff)));
++	} else
++		return;		/* root and system AIDs keep the root domain */
++	if (write_attr("/proc/self/attr/current", ctx) != 0)
++		error("Android: could not switch to SELinux context %s: %s",
++		    ctx, strerror(errno));
++}
++
++const char *
++android_session_shell(struct passwd *pw, int interactive)
++{
++	if (!interactive || pw->pw_shell == NULL || pw->pw_shell[0] != '/' ||
++	    access(pw->pw_shell, X_OK) != 0)
++		return ANDROID_DEFAULT_SHELL;
++	return pw->pw_shell;
++}
++
++/* Variables sshd sets itself or that must not leak into sessions. */
++static int
++env_skip(const char *name, size_t len)
++{
++	static const char *skip[] = {
++		"HOME", "USER", "LOGNAME", "SHELL", "MAIL", "TERM", "PWD",
++		"OLDPWD", "SHLVL", "_", "DISPLAY", "TZ", "LD_PRELOAD",
++		"LD_LIBRARY_PATH", "ASH_STANDALONE", "MODPATH", "MODDIR",
++		NULL
++	};
++	static const char *skip_prefix[] = {
++		"SSH_", "KSU", "MAGISK", "APATCH", "ZYGISK", "ANDROID_SOCKET_",
++		"OSA_",
++		NULL
++	};
++	int i;
++
++	for (i = 0; skip[i] != NULL; i++)
++		if (strlen(skip[i]) == len && strncmp(name, skip[i], len) == 0)
++			return 1;
++	for (i = 0; skip_prefix[i] != NULL; i++)
++		if (strncmp(name, skip_prefix[i], strlen(skip_prefix[i])) == 0)
++			return 1;
++	return 0;
++}
++
++void
++android_session_env(char ***envp, u_int *envsizep,
++    void (*set)(char ***, u_int *, const char *, const char *))
++{
++	char **e, name[256];
++	const char *eq;
++	size_t len;
++
++	/* sshd is started with init's environment (see sshdctl). */
++	for (e = environ; e != NULL && *e != NULL; e++) {
++		if ((eq = strchr(*e, '=')) == NULL)
++			continue;
++		len = eq - *e;
++		if (len == 0 || len >= sizeof(name) || env_skip(*e, len))
++			continue;
++		memcpy(name, *e, len);
++		name[len] = '\0';
++		set(envp, envsizep, name, eq + 1);
++	}
++	if (getenv("TMPDIR") == NULL)
++		set(envp, envsizep, "TMPDIR", ANDROID_TMPDIR);
++}
++
++void
++android_wakelock(const char *name, int timeout_sec)
++{
++	char buf[160];
++
++	if (timeout_sec > 0)
++		snprintf(buf, sizeof(buf), "%s %lld", name,
++		    (long long)timeout_sec * 1000000000LL);
++	else
++		strlcpy(buf, name, sizeof(buf));
++	if (write_attr("/sys/power/wake_lock", buf) != 0)
++		debug("Android: wake_lock %s: %s", name, strerror(errno));
++}
++
++void
++android_wakeunlock(const char *name)
++{
++	if (write_attr("/sys/power/wake_unlock", name) != 0 && errno != EINVAL)
++		debug("Android: wake_unlock %s: %s", name, strerror(errno));
++}
++
++#endif /* __ANDROID__ */
+diff --git a/android.h b/android.h
+new file mode 100644
+index 0000000..123870f
+--- /dev/null
++++ b/android.h
+@@ -0,0 +1,73 @@
++/*
++ * Android (bionic) support for OpenSSH.
++ *
++ * Bionic has no /etc/passwd: every account comes from a table compiled into
++ * libc with pw_dir "/" and pw_shell "/bin/sh", there is no crypt(3), no
++ * shadow file, no PAM, and getgrouplist() only returns the primary group.
++ * This file papers over that so OpenSSH behaves like it does on a normal
++ * Linux system, plus adds what Android needs for a login session (SELinux
++ * domain, adb-shell groups, init's environment, wakelocks).
++ */
++#ifndef OPENSSH_ANDROID_H
++#define OPENSSH_ANDROID_H
++
++#ifdef __ANDROID__
++
++#include <sys/types.h>
++#include <pwd.h>
++
++#ifndef ANDROID_PREFIX
++# define ANDROID_PREFIX		"/product"
++#endif
++/* World-readable copy of the account overrides (name:home:shell). */
++#define ANDROID_PASSWD_FILE	ANDROID_PREFIX "/share/openssh/passwd"
++#define ANDROID_PACKAGES_LIST	"/data/system/packages.list"
++#define ANDROID_DEFAULT_SHELL	"/system/bin/sh"
++#define ANDROID_ROOT_HOME	"/data/root"
++#define ANDROID_SHELL_HOME	"/data/shell"
++#define ANDROID_TMPDIR		"/data/local/tmp"
++
++#define AID_ROOT		0
++#define AID_SHELL		2000
++#define AID_APP_START		10000
++#define AID_APP_END		19999
++#define AID_USER_OFFSET		100000
++
++/*
++ * Every getpwnam()/getpwuid() in OpenSSH goes through these (see the macros
++ * at the bottom of includes.h) so the client and server both see the real
++ * home directory and preferred shell instead of "/" and "/bin/sh".
++ */
++struct passwd *android_getpwnam(const char *);
++struct passwd *android_getpwuid(uid_t);
++
++/*
++ * Account lookup for an incoming login.  Unlike getpwnam() this never fails:
++ *   "root", "shell", any bionic name (system, u0_a123, ...)  -> that account
++ *   an installed package name (com.example.app)              -> its app uid
++ *   anything else (e.g. the client's local username)         -> root
++ */
++struct passwd *android_login_pw(const char *user);
++
++/* Replacement for initgroups(): adb's groups for shell, app gids for apps. */
++int android_initgroups(const char *name, gid_t basegid);
++
++/*
++ * Switch to the SELinux domain for the account (after setuid, before exec):
++ * u:r:shell:s0 for shell, u:r:runas_app:s0:cX,... for apps (like run-as).
++ */
++void android_set_selinux_context(uid_t uid);
++
++/* Shell for a session: preferred shell when interactive, sh for commands. */
++const char *android_session_shell(struct passwd *pw, int interactive);
++
++/* Copy init's environment (BOOTCLASSPATH, ANDROID_*, ...) into a session. */
++void android_session_env(char ***envp, u_int *envsizep,
++    void (*set)(char ***, u_int *, const char *, const char *));
++
++/* Kernel wakelocks (/sys/power/wake_lock); timeout_sec <= 0 means none. */
++void android_wakelock(const char *name, int timeout_sec);
++void android_wakeunlock(const char *name);
++
++#endif /* __ANDROID__ */
++#endif /* OPENSSH_ANDROID_H */
+diff --git a/auth.c b/auth.c
+index a4a37c1..f5bf61f 100644
+--- a/auth.c
++++ b/auth.c
+@@ -473,8 +473,20 @@ getpwnamallow(struct ssh *ssh, const char *user)
+ 	u_int i;
+ 
+ 	ci = server_get_connection_info(ssh, 1, options.use_dns);
++#ifdef __ANDROID__
++	/*
++	 * Android has no user database: map the login name to an account
++	 * (unknown names become root) and let Match see the account name.
++	 * authctxt->user keeps the name the client sent, since the client
++	 * signs it during publickey authentication.
++	 */
++	pw = android_login_pw(user);
++	ci->user = pw != NULL ? xstrdup(pw->pw_name) : user;
++	ci->user_invalid = pw == NULL;
++#else
+ 	ci->user = user;
+ 	ci->user_invalid = getpwnam(user) == NULL;
++#endif
+ 	parse_server_match_config(&options, &includes, ci);
+ 	log_change_level(options.log_level);
+ 	log_verbose_reset();
+@@ -489,7 +501,11 @@ getpwnamallow(struct ssh *ssh, const char *user)
+ 	aix_setauthdb(user);
+ #endif
+ 
++#ifdef __ANDROID__
++	pw = android_login_pw(user);
++#else
+ 	pw = getpwnam(user);
++#endif
+ 
+ #if defined(_AIX) && defined(HAVE_SETAUTHDB)
+ 	aix_restoreauthdb();
+diff --git a/configure.ac b/configure.ac
+index bb4d065..cba8388 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -772,10 +772,6 @@ case "$host" in
+ 	AC_DEFINE([BROKEN_STRNDUP], 1, [strndup broken, see APAR IY61211])
+ 	AC_DEFINE([BROKEN_STRNLEN], 1, [strnlen broken, see APAR IY62551])
+ 	;;
+-*-*-android*)
+-	AC_DEFINE([DISABLE_UTMP], [1], [Define if you don't want to use utmp])
+-	AC_DEFINE([DISABLE_WTMP], [1], [Define if you don't want to use wtmp])
+-	;;
+ *-*-cygwin*)
+ 	is_cygwin=1
+ 	LIBS="$LIBS /usr/lib/textreadmode.o"
+@@ -974,8 +970,18 @@ int main(void) { if (NSVersionOfRunTimeLibrary("System") >= (60 << 16))
+ 	AC_DEFINE([LINK_OPNOTSUPP_ERRNO], [EPERM],
+ 		[Define to whatever link() returns for "not supported"
+ 		if it doesn't return EOPNOTSUPP.])
+-	AC_DEFINE([_PATH_BTMP], ["/var/log/btmp"], [log for bad login attempts])
+-	AC_DEFINE([USE_BTMP])
++	case "$host" in
++	*-*-android*)
++		# Android: Linux kernel, bionic libc, no login records or systemd.
++		AC_DEFINE([DISABLE_UTMP], [1], [Define if you don't want to use utmp])
++		AC_DEFINE([DISABLE_WTMP], [1], [Define if you don't want to use wtmp])
++		is_android=yes
++		;;
++	*)
++		AC_DEFINE([_PATH_BTMP], ["/var/log/btmp"], [log for bad login attempts])
++		AC_DEFINE([USE_BTMP])
++		;;
++	esac
+ 	AC_DEFINE([LINUX_OOM_ADJUST], [1], [Adjust Linux out-of-memory killer])
+ 	AC_ARG_WITH([linux-memlock-onfault],
+ 		[  --with-linux-memlock-onfault Enables memory locking on Linux],
+@@ -998,7 +1004,9 @@ int main(void) { if (NSVersionOfRunTimeLibrary("System") >= (60 << 16))
+ 		],
+ 	)
+ 
+-	AC_DEFINE([SYSTEMD_NOTIFY], [1], [Have sshd notify systemd on start/reload])
++	if test "x$is_android" != "xyes"; then
++		AC_DEFINE([SYSTEMD_NOTIFY], [1], [Have sshd notify systemd on start/reload])
++	fi
+ 	inet6_default_4in6=yes
+ 	case `uname -r` in
+ 	1.*|2.0.*)
+diff --git a/includes.h b/includes.h
+index 96cddbc..cd40bb8 100644
+--- a/includes.h
++++ b/includes.h
+@@ -181,4 +181,10 @@
+ 
+ #include "entropy.h"
+ 
++#ifdef __ANDROID__
++# include "android.h"
++# define getpwnam(n)	android_getpwnam(n)
++# define getpwuid(u)	android_getpwuid(u)
++#endif
++
+ #endif /* INCLUDES_H */
+diff --git a/misc.c b/misc.c
+index 866f7b8..19c9be2 100644
+--- a/misc.c
++++ b/misc.c
+@@ -1930,7 +1930,11 @@ mktemp_proto(char *s, size_t len)
+ 		if (r > 0 && (size_t)r < len)
+ 			return;
+ 	}
++#ifdef __ANDROID__
++	r = snprintf(s, len, ANDROID_TMPDIR "/ssh-XXXXXXXXXXXX");
++#else
+ 	r = snprintf(s, len, "/tmp/ssh-XXXXXXXXXXXX");
++#endif
+ 	if (r < 0 || (size_t)r >= len)
+ 		fatal_f("template string too short");
+ }
+diff --git a/openbsd-compat/explicit_bzero.c b/openbsd-compat/explicit_bzero.c
+index 68cd2c1..3f7b901 100644
+--- a/openbsd-compat/explicit_bzero.c
++++ b/openbsd-compat/explicit_bzero.c
+@@ -39,7 +39,12 @@ explicit_bzero(void *p, size_t n)
+  * Indirect bzero through a volatile pointer to hopefully avoid
+  * dead-store optimisation eliminating the call.
+  */
++#ifdef __ANDROID__
++static void *(* volatile ssh_memset)(void *, int, size_t) = memset;
++#define ssh_bzero(p, n) ssh_memset((p), 0, (n))
++#else
+ static void (* volatile ssh_bzero)(void *, size_t) = bzero;
++#endif
+ 
+ void
+ explicit_bzero(void *p, size_t n)
+diff --git a/openbsd-compat/getrrsetbyname.c b/openbsd-compat/getrrsetbyname.c
+index 36e558c..65ba968 100644
+--- a/openbsd-compat/getrrsetbyname.c
++++ b/openbsd-compat/getrrsetbyname.c
+@@ -47,7 +47,28 @@
+ 
+ #include "includes.h"
+ 
+-#if !defined (HAVE_GETRRSETBYNAME) && !defined (HAVE_LDNS)
++#if defined(__ANDROID__) && !defined(HAVE_GETRRSETBYNAME) && !defined(HAVE_LDNS)
++/*
++ * Bionic doesn't expose the resolver internals (_res, res_query) this
++ * needs, so SSHFP lookups (VerifyHostKeyDNS) simply find no records.
++ */
++#include <stdlib.h>
++#include "getrrsetbyname.h"
++
++int
++getrrsetbyname(const char *hostname, unsigned int rdclass,
++    unsigned int rdtype, unsigned int flags, struct rrsetinfo **res)
++{
++	*res = NULL;
++	return ERRSET_NODATA;
++}
++
++void
++freerrset(struct rrsetinfo *rrset)
++{
++	free(rrset);
++}
++#elif !defined (HAVE_GETRRSETBYNAME) && !defined (HAVE_LDNS)
+ 
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/openbsd-compat/xcrypt.c b/openbsd-compat/xcrypt.c
+index 9cded66..dd6153d 100644
+--- a/openbsd-compat/xcrypt.c
++++ b/openbsd-compat/xcrypt.c
+@@ -78,6 +78,10 @@ pick_salt(void)
+ 	if (salt[0] != '\0')
+ 		return salt;
+ 	strlcpy(salt, "xx", sizeof(salt));
++#ifdef __ANDROID__
++	/* No password database to search on Android. */
++	return salt;
++#endif
+ 	setpwent();
+ 	while ((pw = getpwent()) != NULL) {
+ 		if ((passwd = shadow_pw(pw)) == NULL)
+@@ -113,6 +117,10 @@ xcrypt(const char *password, const char *salt)
+ 		crypted = crypt(password, salt);
+ # elif defined(HAVE_SECUREWARE)
+ 	crypted = bigcrypt(password, salt);
++# elif defined(__ANDROID__)
++	/* Bionic has no crypt(3): password authentication always fails. */
++	(void)password;
++	crypted = NULL;
+ # else
+ 	crypted = crypt(password, salt);
+ #endif
+diff --git a/sandbox-seccomp-filter.c b/sandbox-seccomp-filter.c
+index f696d50..ea863ea 100644
+--- a/sandbox-seccomp-filter.c
++++ b/sandbox-seccomp-filter.c
+@@ -338,6 +338,9 @@ static const struct sock_filter preauth_insns[] = {
+ #ifdef __NR_getuid32
+ 	SC_ALLOW(__NR_getuid32),
+ #endif
++#if defined(__ANDROID__) && defined(__NR_prctl)
++	SC_DENY(__NR_prctl, EINVAL),
++#endif
+ #ifdef __NR_madvise
+ 	SC_ALLOW_ARG(__NR_madvise, 2, MADV_NORMAL),
+ # ifdef MADV_FREE
+diff --git a/session.c b/session.c
+index 9125cbb..8877c7f 100644
+--- a/session.c
++++ b/session.c
+@@ -249,7 +249,11 @@ prepare_auth_info_file(struct passwd *pw, struct sshbuf *info)
+ 		return;
+ 
+ 	temporarily_use_uid(pw);
++	#ifdef __ANDROID__
++	auth_info_file = xstrdup(ANDROID_TMPDIR "/sshauth.XXXXXXXXXXXXXXX");
++#else
+ 	auth_info_file = xstrdup("/tmp/sshauth.XXXXXXXXXXXXXXX");
++#endif
+ 	if ((fd = mkstemp(auth_info_file)) == -1) {
+ 		error_f("mkstemp: %s", strerror(errno));
+ 		goto out;
+@@ -841,7 +845,7 @@ read_environment_file(char ***env, u_int *envsize,
+ 	fclose(f);
+ }
+ 
+-#ifdef HAVE_ETC_DEFAULT_LOGIN
++#if defined(HAVE_ETC_DEFAULT_LOGIN) || defined(__ANDROID__)
+ /*
+  * Return named variable from specified environment, or NULL if not present.
+  */
+@@ -973,6 +977,11 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
+ 	ssh_gssapi_do_child(&env, &envsize);
+ #endif
+ 
++#ifdef __ANDROID__
++	/* init's environment: BOOTCLASSPATH, ANDROID_*, PATH, TMPDIR, ... */
++	android_session_env(&env, &envsize, child_set_env);
++#endif
++
+ 	/* Set basic environment. */
+ 	for (i = 0; i < s->num_env; i++)
+ 		child_set_env(&env, &envsize, s->env[i].name, s->env[i].val);
+@@ -1000,6 +1009,9 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
+ 	read_etc_default_login(&env, &envsize, pw->pw_uid);
+ 	path = child_get_env(env, "PATH");
+ #  endif /* HAVE_ETC_DEFAULT_LOGIN */
++#  ifdef __ANDROID__
++	path = child_get_env(env, "PATH");
++#  endif
+ 	if (path == NULL || *path == '\0') {
+ 		child_set_env(&env, &envsize, "PATH",
+ 		    s->pw->pw_uid == 0 ?  SUPERUSER_PATH : _PATH_STDPATH);
+@@ -1007,11 +1019,13 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
+ # endif /* HAVE_CYGWIN */
+ #endif /* HAVE_LOGIN_CAP */
+ 
++#ifndef __ANDROID__
+ 	if (!options.use_pam) {
+ 		snprintf(buf, sizeof buf, "%.200s/%.50s",
+ 		    _PATH_MAILDIR, pw->pw_name);
+ 		child_set_env(&env, &envsize, "MAIL", buf);
+ 	}
++#endif
+ 
+ 	/* Normal systems set SHELL by default. */
+ 	child_set_env(&env, &envsize, "SHELL", shell);
+@@ -1339,7 +1353,11 @@ do_setusercontext(struct passwd *pw)
+ 			exit(1);
+ 		}
+ 		/* Initialize the group list. */
++#ifdef __ANDROID__
++		if (android_initgroups(pw->pw_name, pw->pw_gid) < 0) {
++#else
+ 		if (initgroups(pw->pw_name, pw->pw_gid) < 0) {
++#endif
+ 			perror("initgroups");
+ 			exit(1);
+ 		}
+@@ -1529,7 +1547,16 @@ do_child(struct ssh *ssh, Session *s, const char *command)
+ 	 * Get the shell from the password data.  An empty shell field is
+ 	 * legal, and means /bin/sh.
+ 	 */
++#ifdef __ANDROID__
++	/*
++	 * The account's preferred shell (zsh, bash, ...) is only used for
++	 * interactive logins; commands, scp, sftp and rsync always run under
++	 * /system/bin/sh so they behave the same whatever the user picked.
++	 */
++	shell = android_session_shell(pw, command == NULL);
++#else
+ 	shell = (pw->pw_shell[0] == '\0') ? _PATH_BSHELL : pw->pw_shell;
++#endif
+ 
+ 	/*
+ 	 * Make sure $SHELL points to the shell from the password file,
+@@ -1556,6 +1583,15 @@ do_child(struct ssh *ssh, Session *s, const char *command)
+ 	 */
+ 	environ = env;
+ 
++#ifdef __ANDROID__
++	/*
++	 * adb-shell / run-as style SELinux domain for shell and app users.
++	 * Done once the environment is built (SSH_CONNECTION needs the
++	 * socket) and the connection descriptors are closed.
++	 */
++	android_set_selinux_context(pw->pw_uid);
++#endif
++
+ #if defined(KRB5) && defined(USE_AFS)
+ 	/*
+ 	 * At this point, we check to see if AFS is active and if we have
+@@ -1648,9 +1684,14 @@ do_child(struct ssh *ssh, Session *s, const char *command)
+ 
+ 		/* Start the shell.  Set initial character to '-'. */
+ 		argv0[0] = '-';
++#ifdef __ANDROID__
++		/* Non-login bash, so it reads ~/.bashrc like users expect. */
++		if (strcmp(shell0, "bash") == 0)
++			memmove(argv0, argv0 + 1, sizeof(argv0) - 1);
++#endif
+ 
+-		if (strlcpy(argv0 + 1, shell0, sizeof(argv0) - 1)
+-		    >= sizeof(argv0) - 1) {
++		if (strlcpy(argv0 + (argv0[0] == '-'), shell0,
++		    sizeof(argv0) - 1) >= sizeof(argv0) - 1) {
+ 			errno = EINVAL;
+ 			perror(shell);
+ 			exit(1);
+diff --git a/sshd-auth.c b/sshd-auth.c
+index 3adf1a4..b8e7bc3 100644
+--- a/sshd-auth.c
++++ b/sshd-auth.c
+@@ -440,6 +440,9 @@ main(int ac, char **av)
+ 	extern char *optarg;
+ 	extern int optind;
+ 	int r, opt, have_key = 0;
++#ifdef __ANDROID__
++	int devnull;
++#endif
+ 	int sock_in = -1, sock_out = -1, rexeced_flag = 0;
+ 	u_int i;
+ 	mode_t new_umask;
+@@ -448,6 +451,20 @@ main(int ac, char **av)
+ 	uint64_t timing_secret = 0;
+ 
+ 	closefrom(PRIVSEP_MIN_FREE_FD);
++#ifdef __ANDROID__
++	/*
++	 * Keep the low fds occupied as sshd-session does: with the bionic
++	 * atrace tag enabled the linker has already opened trace_marker and
++	 * keeps writing to that fd number, which would otherwise be reused
++	 * for the client socket and corrupt the SSH stream.
++	 */
++	if ((devnull = open(_PATH_DEVNULL, O_RDWR)) == -1)
++		fatal("open %s: %s", _PATH_DEVNULL, strerror(errno));
++	while (devnull < PRIVSEP_MIN_FREE_FD) {
++		if ((devnull = dup(devnull)) == -1)
++			fatal("dup %s: %s", _PATH_DEVNULL, strerror(errno));
++	}
++#endif
+ 	sigemptyset(&sigmask);
+ 	sigprocmask(SIG_SETMASK, &sigmask, NULL);
+ 
+diff --git a/sshd-session.c b/sshd-session.c
+index 1af9bcf..9744985 100644
+--- a/sshd-session.c
++++ b/sshd-session.c
+@@ -368,6 +368,36 @@ privsep_preauth(struct ssh *ssh)
+ 	}
+ }
+ 
++#ifdef __ANDROID__
++/*
++ * Keep the device awake while a connection is open, so long-running
++ * commands don't freeze when the screen turns off.  Disabled with
++ * OSA_WAKELOCK=0 in sshd's environment.
++ */
++static char android_wakelock_name[64];
++
++static void
++android_session_wakelock(int timeout_sec)
++{
++	const char *e = getenv("OSA_WAKELOCK");
++
++	if (e != NULL && strcmp(e, "0") == 0)
++		return;
++	if (android_wakelock_name[0] == '\0')
++		snprintf(android_wakelock_name, sizeof(android_wakelock_name),
++		    "openssh-%ld", (long)getpid());
++	android_wakelock(android_wakelock_name, timeout_sec);
++}
++
++static void
++android_session_wakeunlock(void)
++{
++	if (android_wakelock_name[0] != '\0' &&
++	    strtol(android_wakelock_name + 8, NULL, 10) == (long)getpid())
++		android_wakeunlock(android_wakelock_name);
++}
++#endif
++
+ static void
+ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
+ {
+@@ -379,6 +409,11 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
+ 		fatal("fork of unprivileged child failed");
+ 	else if (pmonitor->m_pid != 0) {
+ 		verbose("User child is on pid %ld", (long)pmonitor->m_pid);
++#ifdef __ANDROID__
++		/* Authenticated: hold the wakelock until the monitor exits. */
++		android_session_wakelock(0);
++		atexit(android_session_wakeunlock);
++#endif
+ 		sshbuf_reset(loginmsg);
+ 		monitor_clear_keystate(ssh, pmonitor);
+ 		monitor_child_postauth(ssh, pmonitor);
+@@ -1122,6 +1157,11 @@ main(int ac, char **av)
+ 
+ 	/* This is the child processing a new connection. */
+ 	setproctitle("%s", "[accepted]");
++#ifdef __ANDROID__
++	/* Don't let the device suspend in the middle of authentication. */
++	android_session_wakelock(options.login_grace_time > 0 ?
++	    options.login_grace_time + 5 : 120);
++#endif
+ 
+ 	/* Executed child processes don't need these. */
+ 	FD_CLOSEONEXEC(sock_out);
+@@ -1349,6 +1389,9 @@ cleanup_exit(int i)
+ 	/* done after do_cleanup so it can cancel the PAM auth 'thread' */
+ 	if (the_active_state != NULL && mm_is_monitor())
+ 		audit_event(the_active_state, SSH_CONNECTION_ABANDON);
++#endif
++#ifdef __ANDROID__
++	android_session_wakeunlock();
+ #endif
+ 	/* Override default fatal exit value when auth was attempted */
+ 	if (i == 255 && monitor_auth_attempted())

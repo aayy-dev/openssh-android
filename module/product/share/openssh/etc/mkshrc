@@ -1,0 +1,47 @@
+# /system/etc/mkshrc, provided by the OpenSSH for Android module.
+#
+# Runs the device's stock mkshrc, gives root and shell a real HOME
+# (/data/root and /data/shell), then switches to the preferred shell picked
+# with `sshdctl shell <user> zsh|bash|sh` (or the WebUI).
+# Personal settings belong in ~/.profile (sh), ~/.bashrc or ~/.zshrc.
+
+_osa=/product/share/openssh
+[ -r $_osa/etc/mkshrc.stock ] && . $_osa/etc/mkshrc.stock
+
+# The stock prompt shows $HOSTNAME, which adbd and sshd set to the device
+# name; fall back to the same name if it's missing (exported for zsh/bash).
+case ${HOSTNAME:-localhost} in localhost) HOSTNAME=$(getprop ro.build.product 2>/dev/null) ;; esac
+export HOSTNAME
+
+if [ "${HOME:-/}" = / ]; then
+	case $USER_ID in
+	0)	[ -d /data/root ] && HOME=/data/root ;;
+	2000)	[ -d /data/shell ] && HOME=/data/shell ;;
+	esac
+	export HOME
+fi
+[ "$PWD" = / ] && [ "$HOME" != / ] && cd "$HOME" 2>/dev/null
+export TMPDIR=${TMPDIR:-/data/local/tmp}
+
+# Switch to the preferred shell once per session (zsh and bash export
+# _OSA_SHELL, so typing `sh` inside them still gives you mksh).
+if [ -z "$_OSA_SHELL" ] && [ -r $_osa/passwd ]; then
+	export _OSA_SHELL=1
+	_osa_u=$(id -un 2>/dev/null)
+	_osa_sh=
+	while IFS=: read -r _osa_n _osa_h _osa_s; do
+		[ "$_osa_n" = "$_osa_u" ] && _osa_sh=$_osa_s
+	done < $_osa/passwd
+	case $_osa_sh in
+	*/zsh)	[ -x "$_osa_sh" ] && exec "$_osa_sh" -l ;;
+	*/bash)	[ -x "$_osa_sh" ] && exec "$_osa_sh" ;;
+	esac
+	unset _osa_u _osa_sh _osa_n _osa_h _osa_s
+fi
+
+# sh users: ~/.profile (login shells, e.g. over ssh, have read it already).
+case $0 in
+-*)	;;
+*)	[ -r "$HOME/.profile" ] && . "$HOME/.profile" ;;
+esac
+unset _osa

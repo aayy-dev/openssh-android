@@ -1,0 +1,41 @@
+# Global zshrc (OpenSSH for Android module, replaced on update).
+# Your ~/.zshrc runs after this. To skip it entirely, put
+# `unsetopt GLOBAL_RCS` in ~/.zshenv.
+[[ -o interactive ]] || return 0
+
+[[ $PWD == / && $HOME != / ]] && cd ~
+
+HISTFILE=${HISTFILE:-$HOME/.zsh_history}
+HISTSIZE=10000
+SAVEHIST=10000
+setopt append_history inc_append_history hist_ignore_dups hist_ignore_space
+setopt interactive_comments no_beep
+
+# Emacs keys plus Home/End/Delete/PageUp/PageDown from terminfo.
+bindkey -e
+typeset -A _osa_keys
+_osa_keys=(khome beginning-of-line kend end-of-line kdch1 delete-char
+	kpp beginning-of-buffer-or-history knp end-of-buffer-or-history
+	kcuu1 up-line-or-history kcud1 down-line-or-history)
+for _k in ${(k)_osa_keys}; do
+	[[ -n ${terminfo[$_k]} ]] && bindkey -- "${terminfo[$_k]}" ${_osa_keys[$_k]}
+done
+unset _k _osa_keys
+if (( ${+terminfo[smkx]} && ${+terminfo[rmkx]} )); then
+	function zle-line-init { echoti smkx }
+	function zle-line-finish { echoti rmkx }
+	zle -N zle-line-init
+	zle -N zle-line-finish
+fi
+
+autoload -Uz compinit
+compinit -i -d "$HOME/.zcompdump" 2>/dev/null
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'
+
+# adbd and sshd set HOSTNAME to the device name; Android's own hostname is
+# "localhost".  The prompt is built now (not with prompt_subst, which this
+# file doesn't enable) so the name is filled in.
+[[ -n $HOSTNAME && $HOSTNAME != localhost ]] || HOSTNAME=$(getprop ro.build.product 2>/dev/null)
+export HOSTNAME=${HOSTNAME:-localhost}
+PROMPT="%F{%(!.red.green)}%n@${HOSTNAME//\%/%%}%f:%F{blue}%~%f %# "

@@ -1,0 +1,6 @@
+# System-wide ssh client config for OpenSSH for Android.
+# Per-user settings go in ~/.ssh/config (/data/root/.ssh/config for root).
+
+Host *
+#   ServerAliveInterval 60
+#   IdentityFile ~/.ssh/id_ed25519

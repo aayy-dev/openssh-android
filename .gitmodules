@@ -22,3 +22,9 @@
 	path = zsh
 	url = https://github.com/zsh-users/zsh
 	branch = master
+[submodule "ncurses"]
+	path = ncurses
+	url = https://github.com/ThomasDickey/ncurses-snapshots
+[submodule "rsync"]
+	path = rsync
+	url = https://github.com/RsyncProject/rsync
